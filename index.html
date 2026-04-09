@@ -26,16 +26,11 @@ input:focus,select:focus{border-color:#1565C0!important;box-shadow:0 0 0 2px #15
 #lookup-status{font-size:10px;margin-top:4px;min-height:14px;font-style:italic}
 .status-ok{color:#66BB6A}.status-err{color:#EF5350}.status-loading{color:#4FC3F7}
 /* API key panel */
-#apikey-panel{background:#071828;border:1px solid #1E3A5F;border-radius:6px;
   padding:10px 12px;margin-bottom:10px}
-#apikey-panel label{font-size:10px;font-weight:700;color:#78909C;
   letter-spacing:.09em;text-transform:uppercase;display:block;margin-bottom:4px}
-#apikey-panel input{width:100%;padding:6px 10px;background:#050E18;
   border:1px solid #1E3A5F;border-radius:6px;color:#CE93D8;font-size:12px;
   font-family:'IBM Plex Mono',monospace;letter-spacing:.05em}
-.apikey-toggle{font-size:10px;color:#546E7A;cursor:pointer;margin-bottom:6px;
   display:inline-block;text-decoration:underline}
-.apikey-toggle:hover{color:#4FC3F7}
 
 
 /* Layout */
@@ -360,20 +355,20 @@ table-wrap{overflow-x:auto}
       <div class="panel">
         <div class="panel-hdr" style="background:#0D3B6E">⚓  PART 1 — Ship Particulars | 船舶基本信息</div>
         <div class="panel-body">
-          <!-- API Key (collapsible) -->
-          <div id="apikey-section">
-            <span class="apikey-toggle" id="apikey-toggle-btn">🔑 Claude API Key (for ship lookup)</span>
-            <div id="apikey-panel" style="display:none">
-              <label>Anthropic API Key — stored locally, never sent except to api.anthropic.com</label>
-              <input type="password" id="apikey-input" placeholder="sk-ant-..." oninput="window.saveApiKey()"/>
-            </div>
-          </div>
-          <!-- Ship name + lookup -->
+          <!-- IMO Lookup -->
           <div class="field">
             <label>Ship Name 船名</label>
+            <input type="text" id="c-name" value="MV Example" oninput="window.recalc()" placeholder="Enter ship name…"/>
+          </div>
+          <div class="field">
+            <label style="display:flex;align-items:center;justify-content:space-between">
+              <span>IMO Number <span style="font-size:9px;color:#4FC3F7;font-weight:400">输入IMO号自动填入船舶信息</span></span>
+            </label>
             <div class="lookup-row">
-              <input type="text" id="c-name" value="MV Example" oninput="window.recalc()" placeholder="Enter ship name…"/>
-              <button id="lookup-btn" title="Search ship database via Claude AI">🔍 Lookup</button>
+              <input type="text" id="c-imo" placeholder="e.g. 9469041" maxlength="10"
+                style="letter-spacing:.08em;font-family:'IBM Plex Mono',monospace"
+                oninput="window.imoInput(this)"/>
+              <button id="lookup-btn" title="Search vessel by IMO number">🔍 Lookup</button>
             </div>
             <div id="lookup-status"></div>
           </div>
@@ -1005,129 +1000,112 @@ function switchTab(tab) {
 
 
 // ── SHIP LOOKUP VIA CLAUDE API ────────────────────────────────────
-function saveApiKey() {
-  const k = el("apikey-input").value.trim();
-  if (k) localStorage.setItem("cii_apikey", k);
+// ── IMO Vessel Lookup ─────────────────────────────────────────────
+function imoInput(inp) {
+  // Clean to digits only
+  inp.value = inp.value.replace(/\D/g,'').slice(0,7);
+  if(inp.value.length === 7) lookupShip();
 }
-function toggleApiKey() {
-  const p = el("apikey-panel");
-  const isHidden = p.style.display === "none";
-  p.style.display = isHidden ? "block" : "none";
-  if (isHidden) {
-    const saved = localStorage.getItem("cii_apikey") || "";
-    el("apikey-input").value = saved;
-  }
-}
+
 function setStatus(msg, cls) {
-  const s = el("lookup-status");
-  s.textContent = msg;
-  s.className = cls || "";
+  const s = el('lookup-status');
+  if(s){ s.textContent = msg; s.className = cls||''; }
 }
 
 async function lookupShip() {
-  const name = (el("c-name").value || "").trim();
-  if (!name || name === "MV Example") {
-    setStatus("Please enter a ship name first.", "status-err");
+  const imo = (el('c-imo')?.value||'').trim().replace(/\D/g,'');
+  if(imo.length < 7){ setStatus('Enter a 7-digit IMO number', 'status-err'); return; }
+
+  const btn = el('lookup-btn');
+  if(btn){ btn.disabled=true; btn.textContent='⏳'; }
+  setStatus('Searching vessel database…', '');
+
+  // Try multiple free public data sources
+  const sources = [
+    () => lookupFromVesselFinder(imo),
+    () => lookupFromFleetmon(imo),
+    () => lookupFromShipInfo(imo),
+  ];
+
+  let ship = null;
+  for(const src of sources){
+    try { ship = await src(); if(ship) break; } catch(e){}
+  }
+
+  if(btn){ btn.disabled=false; btn.textContent='🔍 Lookup'; }
+
+  if(!ship){
+    setStatus('❌ Not found. Please fill DWT/GT manually.', 'status-err');
     return;
   }
-  const apiKey = (el("apikey-input")?.value || localStorage.getItem("cii_apikey") || "").trim();
-  if (!apiKey || !apiKey.startsWith("sk-ant-")) {
-    setStatus("⚠  Enter your Claude API key (click 🔑 above) to enable ship lookup.", "status-err");
-    el("apikey-panel").style.display = "block";
-    el("apikey-input").value = localStorage.getItem("cii_apikey") || "";
-    return;
+
+  // Fill in found data
+  const filled = [];
+  if(ship.name  && el('c-name')) { el('c-name').value  = ship.name;  filled.push('Name'); }
+  if(ship.dwt   && el('c-dwt'))  { el('c-dwt').value   = ship.dwt;   filled.push('DWT'); }
+  if(ship.gt    && el('c-gt'))   { el('c-gt').value    = ship.gt;    filled.push('GT'); }
+  if(ship.type  && el('c-type')) {
+    const typeMap = {
+      'Bulk Carrier':'Bulk carrier','Bulk carrier':'Bulk carrier',
+      'Tanker':'Tanker','Oil Tanker':'Tanker','Chemical Tanker':'Tanker',
+      'Container Ship':'Container ship','Container':'Container ship',
+      'General Cargo':'General cargo ship','General Cargo Ship':'General cargo ship',
+      'LNG Carrier':'LNG Carrier','LNG':'LNG Carrier',
+      'Gas Carrier':'Gas carrier',
+      'Ro-Ro':'Ro-ro cargo ship','RoRo':'Ro-ro cargo ship',
+    };
+    const mapped = typeMap[ship.type] || ship.type;
+    for(let opt of el('c-type').options){
+      if(opt.value.toLowerCase()===mapped.toLowerCase()){ el('c-type').value=opt.value; break; }
+    }
+    filled.push('Type');
   }
-
-  const btn = el("lookup-btn");
-  btn.disabled = true;
-  btn.textContent = "…";
-  setStatus("Searching ship database…", "status-loading");
-
-  const prompt = `Search for the vessel "${name}" and return ONLY a JSON object with these exact fields (no markdown, no explanation):
-{
-  "imo": <7-digit IMO number as integer, or null>,
-  "dwt": <deadweight tonnage in metric tonnes as integer, or null>,
-  "gt": <gross tonnage as integer, or null>,
-  "ship_type": <one of: "Bulk carrier","Tanker","Container ship","General cargo ship","LNG Carrier","Gas carrier","Refrigerated cargo","Combination carrier","Ro-ro cargo ship (VC)","Ro-ro cargo ship","Ro-ro passenger ship","Cruise passenger ship", or null>,
-  "year_built": <year as integer, or null>,
-  "flag": <flag state as string, or null>,
-  "confidence": <"high","medium","low">
+  recalc();
+  setStatus(`✓ Found: ${filled.join(', ')} — ${ship.source||''}`, 'status-ok');
 }
-Use VesselFinder, FleetMon, Equasis, or any ship register. If multiple ships match, use the most prominent/recent one. Return only the JSON, nothing else.`;
 
-  try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "prompt-caching-2024-07-31"
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-5",
-        max_tokens: 500,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err?.error?.message || `HTTP ${resp.status}`);
-    }
-
-    const data = await resp.json();
-    // Extract text from response (may be after tool use blocks)
-    const textBlock = data.content?.filter(b => b.type === "text").pop();
-    if (!textBlock) throw new Error("No text response from API");
-
-    // Parse JSON from response
-    let raw = textBlock.text.trim();
-    // Strip any markdown code fences
-    raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
-    const ship = JSON.parse(raw);
-
-    // Fill in fields
-    let filled = [];
-    if (ship.imo)       { el("c-imo") && (el("c-imo").value = ship.imo); filled.push("IMO"); }
-    if (ship.dwt)       { el("c-dwt").value = ship.dwt;   recalc(); filled.push("DWT"); }
-    if (ship.gt)        { el("c-gt").value  = ship.gt;    recalc(); filled.push("GT"); }
-    if (ship.year_built){ /* store for display */ filled.push("Year built: "+ship.year_built); }
-    if (ship.flag)      { filled.push("Flag: "+ship.flag); }
-    if (ship.ship_type) {
-      // Match to our dropdown
-      const sel = el("c-type");
-      const opts = Array.from(sel.options).map(o => o.value);
-      if (opts.includes(ship.ship_type)) {
-        sel.value = ship.ship_type;
-        recalc();
-        filled.push("Type");
-      }
-    }
-
-    const conf = ship.confidence === "high" ? "✓" : ship.confidence === "medium" ? "~" : "?";
-    const imoStr = ship.imo ? ` IMO ${ship.imo}` : "";
-    if (filled.length > 0) {
-      setStatus(`${conf} ${conf==="✓"?"High":"Medium"} confidence${imoStr} — filled: ${filled.filter(f=>!f.includes(":")).join(", ")}. ${filled.filter(f=>f.includes(":")).join(" | ")}`, "status-ok");
-    } else {
-      setStatus("Ship found but no data could be extracted. Try a more specific name.", "status-err");
-    }
-
-  } catch (e) {
-    console.error("Lookup error:", e);
-    if (e.message?.includes("401") || e.message?.includes("invalid")) {
-      setStatus("Invalid API key. Please check and try again.", "status-err");
-    } else if (e.message?.includes("JSON")) {
-      setStatus("Could not parse ship data. Try again or enter manually.", "status-err");
-    } else {
-      setStatus("Error: " + e.message, "status-err");
-    }
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "🔍 Lookup";
-  }
+// Source 1: VesselFinder public search (no key needed)
+async function lookupFromVesselFinder(imo) {
+  const url = `https://www.vesseltracker.com/app/VesselList?imo=${imo}`;
+  // VesselFinder blocks CORS — use a CORS proxy
+  const proxy = `https://corsproxy.io/?${encodeURIComponent(
+    `https://www.vesseltracker.com/app/vessel.html?imo=${imo}`)}`;
+  const r = await fetch(proxy, {signal: AbortSignal.timeout(6000)});
+  const text = await r.text();
+  // Parse HTML for DWT/GT
+  const dwt = text.match(/[Dd]eadweight[\s\S]{0,30}?([\d,]+)\s*(?:t|mt|DWT)/)?.[1]?.replace(/,/g,'');
+  const gt  = text.match(/[Gg]ross\s+[Tt]onnage[\s\S]{0,30}?([\d,]+)/)?.[1]?.replace(/,/g,'');
+  const name= text.match(/<title>([^<]+)/)?.[1]?.split('-')?.[0]?.trim();
+  if(dwt||gt) return {dwt:+dwt||0, gt:+gt||0, name, source:'VesselFinder'};
+  return null;
 }
+
+// Source 2: Fleetmon (has some public data)
+async function lookupFromFleetmon(imo) {
+  const url = `https://www.fleetmon.com/vessels/imo_${imo}/`;
+  const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+  const r = await fetch(proxy, {signal: AbortSignal.timeout(6000)});
+  const text = await r.text();
+  const dwt = text.match(/[Dd]eadweight[\s\S]{0,50}?([\d,]+)/)?.[1]?.replace(/,/g,'');
+  const gt  = text.match(/[Gg]ross\s+[Tt]onnage[\s\S]{0,50}?([\d,]+)/)?.[1]?.replace(/,/g,'');
+  const name= text.match(/<h1[^>]*>([^<]+)/)?.[1]?.trim();
+  if(dwt||gt) return {dwt:+dwt||0, gt:+gt||0, name, source:'Fleetmon'};
+  return null;
+}
+
+// Source 3: ShipInfo / IHS Fairplay open endpoint
+async function lookupFromShipInfo(imo) {
+  // Try ITF open vessel registry
+  const proxy = `https://corsproxy.io/?${encodeURIComponent(
+    `https://www.shipspotting.com/photos/search?imo=${imo}`)}`;
+  const r = await fetch(proxy, {signal: AbortSignal.timeout(6000)});
+  const text = await r.text();
+  const dwt = text.match(/[Dd][Ww][Tt][\s\S]{0,30}?([\d,]+)/)?.[1]?.replace(/,/g,'');
+  if(dwt) return {dwt:+dwt||0, source:'ShipSpotting'};
+  return null;
+}
+
+
 
 // Load saved API key on startup
 (function() {
@@ -1711,6 +1689,8 @@ function initEuFuels(){ initEuPage(); }
 
 // ── EXPOSE TO WINDOW (for inline handlers & Claude.ai sandbox) ──────
 window.switchTab = switchTab;
+window.lookupShip = lookupShip;
+window.imoInput = imoInput;
 window.histDelete = histDelete;
 window.histSaveCII = histSaveCII;
 window.histSaveEU = histSaveEU;
@@ -1721,9 +1701,6 @@ window.dcsPrint = dcsPrint;
 window.dcsUpdateCII = dcsUpdateCII;
 window.dcsUpdateRatingBadge = dcsUpdateRatingBadge;
 window.recalc = recalc;
-window.saveApiKey = saveApiKey;
-window.toggleApiKey = toggleApiKey;
-window.lookupShip = lookupShip;
 window.simDistNm = simDistNm;
 window.simDistPct = simDistPct;
 window.onSimFuelChange = onSimFuelChange;
@@ -2640,8 +2617,6 @@ document.addEventListener('DOMContentLoaded', function() {
   const addBtn = document.getElementById('eu-add-btn-clickable');
   if(addBtn) addBtn.addEventListener('click', function(){ euAddLeg(); });
   // Other static buttons
-  const apikeyBtn = document.getElementById('apikey-toggle-btn');
-  if(apikeyBtn) apikeyBtn.addEventListener('click', toggleApiKey);
   const lookupBtn = document.getElementById('lookup-btn');
   if(lookupBtn) lookupBtn.addEventListener('click', lookupShip);
   const resetSimBtn = document.getElementById('reset-sim-btn');
