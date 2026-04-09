@@ -438,6 +438,18 @@ table-wrap{overflow-x:auto}
           </div>
         </div>
 
+        <!-- Calculate button -->
+        <div style="padding:12px 0 4px;display:flex;align-items:center;gap:12px">
+          <button id="cii-calc-btn"
+            style="padding:10px 28px;background:#1565C0;border:none;border-radius:8px;
+            color:#fff;font-size:13px;font-weight:800;cursor:pointer;letter-spacing:.04em;
+            box-shadow:0 2px 8px #1565C040;transition:all .15s"
+            onmouseover="this.style.background='#1976D2'" onmouseout="this.style.background='#1565C0'">
+            ▶ Calculate &amp; Save 计算并保存
+          </button>
+          <span id="cii-calc-status" style="font-size:11px;color:#059669;font-style:italic"></span>
+        </div>
+
         <!-- Boundary bar -->
         <div class="panel">
           <div class="panel-hdr" style="background:#0D3B6E">📊  CII Rating Boundaries | 评级边界可视化</div>
@@ -729,9 +741,6 @@ function recalc() {
   el("r-cap").textContent = `${fmtN(res.capAtt)} ${st?.cap}`;
   el("r-dist").textContent = `${fmtN(dist)} nm`;
   el("r-red").textContent = `${(res.redPct*100).toFixed(0)}%`;
-
-  // Auto-save to history
-  histSaveCII();
 
   // Boundary bar
   const max = res.bD * 1.18;
@@ -1703,6 +1712,8 @@ function initEuFuels(){ initEuPage(); }
 // ── EXPOSE TO WINDOW (for inline handlers & Claude.ai sandbox) ──────
 window.switchTab = switchTab;
 window.histDelete = histDelete;
+window.histSaveCII = histSaveCII;
+window.histSaveEU = histSaveEU;
 window.histClearAll = histClearAll;
 window.histRender = histRender;
 window.dcsFillFromCII = dcsFillFromCII;
@@ -2645,6 +2656,15 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('dcs-rating')?.addEventListener('change', function(){
     dcsUpdateRatingBadge(this.value);
   });
+  // CII Calculate & Save button
+  const ciiCalcBtn = document.getElementById('cii-calc-btn');
+  if(ciiCalcBtn) ciiCalcBtn.addEventListener('click', function(){
+    recalc();
+    histSaveCII();
+    const st = document.getElementById('cii-calc-status');
+    if(st){ st.textContent='✓ Saved to History'; setTimeout(()=>st.textContent='',3000); }
+  });
+
   // History tab
   const histBtn = document.getElementById('tbtn-hist');
   if(histBtn) histBtn.addEventListener('click', function(){ switchTab('hist'); histRender(); });
