@@ -362,19 +362,19 @@ table-wrap{overflow-x:auto}
               <input type="text" id="c-imo" placeholder="e.g. 9469041" maxlength="10"
                 style="flex:1;padding:7px 10px;background:#0A1929;border:1px solid #1E3A5F;
                 border-radius:6px;color:#E0F2FE;font-size:13px;letter-spacing:.08em;
-                font-family:'IBM Plex Mono',monospace" oninput="window.recalc()"/>
+                font-family:'IBM Plex Mono',monospace" oninput="window.imoInput(this)"/>
               <button id="hifleet-btn"
-                onclick="window.openHifleet()"
-                title="在 HiFleet 查询船舶信息"
+                onclick="window.lookupVessel()"
+                title="查询船舶基础信息 (VesselAPI)"
                 style="padding:7px 14px;background:#1565C0;border:none;border-radius:6px;
-                color:#fff;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;
-                display:flex;align-items:center;gap:5px">
-                🔍 HiFleet查询
+                color:#fff;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap">
+                🔍 Lookup
               </button>
             </div>
             <div style="font-size:10px;color:#546E7A;margin-top:4px">
-              输入IMO号后点击按钮，在 HiFleet 查到 DWT/GT 后手动填入 ↑
+              输入7位IMO号自动查询，或点击🔍按钮手动触发
             </div>
+            <div id="lookup-status" style="font-size:10px;margin-top:3px;min-height:14px"></div>
           </div>
           <div class="field">
             <label>Ship Type 船舶类型</label>
@@ -986,7 +986,16 @@ function switchTab(tab) {
   document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
   document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
   if(tab==='dcs'){ setTimeout(dcsInitFuelRows, 50); }
-  if(tab==='hist'){ setTimeout(histRender, 50); }
+  if(tab==='hist'){
+    setTimeout(()=>{
+      const c=jbinGetCfg();
+      if(c.key && document.getElementById('jbin-api-key'))
+        document.getElementById('jbin-api-key').value=c.key;
+      if(c.id && document.getElementById('jbin-bin-id'))
+        document.getElementById('jbin-bin-id').value=c.id;
+      histRender();
+    }, 50);
+  }
   el("page-"+tab).classList.add("active");
   document.querySelectorAll(".tab-btn").forEach(b=>{
     if (b.getAttribute("onclick")===`switchTab('${tab}')`) b.classList.add("active");
@@ -1005,15 +1014,107 @@ function switchTab(tab) {
 
 // ── SHIP LOOKUP VIA CLAUDE API ────────────────────────────────────
 // ── IMO Vessel Lookup ─────────────────────────────────────────────
-// ── HiFleet vessel lookup ────────────────────────────────────────────────
-function openHifleet() {
+// ── VesselAPI auto lookup ────────────────────────────────────────────────
+const VESSEL_API_KEY = 'EE16B67C49FFE1fc97838C162F751a6A044906245D9C9b8D4B1eebb440968202';
+
+async function lookupVessel() {
   const imo = (document.getElementById('c-imo')?.value||'').trim().replace(/\D/g,'');
-  if(imo.length >= 7) {
-    window.open(`https://www.hifleet.com/vessels/${imo}/`, '_blank');
-  } else {
-    window.open('https://www.hifleet.com/vessels/', '_blank');
+  if(imo.length < 7) { setLookupStatus('Enter 7-digit IMO number','status-err'); return; }
+
+  const btn = document.getElementById('hifleet-btn');
+  const origText = btn ? btn.innerHTML : '';
+  if(btn){ btn.innerHTML='⏳ Searching…'; btn.disabled=true; }
+  setLookupStatus('','');
+
+  try {
+    // Multi-proxy strategy to handle CORS
+    const directUrl = `https://api.vesselapi.com/v1/vessel/${imo}`;
+    // allorigins fetches server-side — we append key as query param via a wrapper
+    // corsproxy.io forwards all headers including Authorization
+    const proxyUrls = [
+      { url: directUrl,
+        opts: { headers: {'Authorization': `Bearer ${VESSEL_API_KEY}`} } },
+      { url: `https://corsproxy.io/?${encodeURIComponent(directUrl)}`,
+        opts: { headers: {'Authorization': `Bearer ${VESSEL_API_KEY}`,
+                          'x-requested-with': 'XMLHttpRequest'} } },
+      { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl + '?apikey=' + VESSEL_API_KEY)}`,
+        opts: {} },
+      { url: `https://thingproxy.freeboard.io/fetch/${directUrl}`,
+        opts: { headers: {'Authorization': `Bearer ${VESSEL_API_KEY}`} } },
+    ];
+
+    let res = null;
+    let lastErr = '';
+    for(const {url, opts} of proxyUrls){
+      try {
+        const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(7000) });
+        if(r.ok || r.status===404 || r.status===401 || r.status===429){
+          res = r; break;
+        }
+      } catch(e){ lastErr = e.message; continue; }
+    }
+    if(!res) throw new Error(lastErr || 'All proxies failed');
+
+    if(!res.ok) {
+      if(res.status===401) { setLookupStatus('❌ Invalid API Key','status-err'); return; }
+      if(res.status===404) { setLookupStatus('❌ Vessel not found','status-err'); return; }
+      if(res.status===429) { setLookupStatus('❌ Monthly limit reached (150 calls)','status-err'); return; }
+      setLookupStatus(`❌ Error ${res.status}`,'status-err'); return;
+    }
+
+    const j = await res.json();
+    const v = j.vessel || j;
+    if(!v) { setLookupStatus('❌ No data returned','status-err'); return; }
+
+    const filled = [];
+    const el = id => document.getElementById(id);
+
+    if(v.name  && el('c-name')){ el('c-name').value = v.name.trim(); filled.push('Ship Name'); }
+    if(v.deadweight_tonnage && el('c-dwt')){
+      el('c-dwt').value = parseFloat(String(v.deadweight_tonnage).replace(/,/g,''))||0;
+      filled.push('DWT');
+    }
+    if(v.gross_tonnage && el('c-gt')){
+      el('c-gt').value = parseFloat(String(v.gross_tonnage).replace(/,/g,''))||0;
+      filled.push('GT');
+    }
+    if(v.vessel_type && el('c-type')){
+      const typeMap = {
+        'Bulk Carrier':'Bulk carrier','Tanker':'Tanker','Oil Tanker':'Tanker',
+        'Chemical Tanker':'Tanker','Container':'Container ship','Container Ship':'Container ship',
+        'General Cargo':'General cargo ship','General Cargo Ship':'General cargo ship',
+        'LNG Carrier':'LNG Carrier','LNG':'LNG Carrier',
+        'Gas Carrier':'Gas carrier','Ro-Ro':'Ro-ro cargo ship',
+      };
+      const mapped = typeMap[v.vessel_type] || v.vessel_type;
+      for(let opt of el('c-type').options){
+        if(opt.value.toLowerCase()===mapped.toLowerCase()){ el('c-type').value=opt.value; break; }
+      }
+      filled.push('Type');
+    }
+
+    recalc();
+    setLookupStatus(`✓ Found: ${filled.join(', ')}`, 'status-ok');
+
+  } catch(e) {
+    setLookupStatus('❌ Network error. Check connection.','status-err');
+  } finally {
+    if(btn){ setTimeout(()=>{ btn.innerHTML=origText; btn.disabled=false; }, 1500); }
   }
 }
+
+function setLookupStatus(msg, cls) {
+  const s = document.getElementById('lookup-status');
+  if(s){ s.textContent=msg; s.className=cls||''; }
+}
+
+// Auto-trigger on 7-digit input
+function imoInput(inp) {
+  inp.value = inp.value.replace(/\D/g,'').slice(0,7);
+  if(inp.value.length===7) lookupVessel();
+}
+
+
 
 
 
@@ -1600,7 +1701,14 @@ function initEuFuels(){ initEuPage(); }
 
 // ── EXPOSE TO WINDOW (for inline handlers & Claude.ai sandbox) ──────
 window.switchTab = switchTab;
-window.openHifleet = openHifleet;
+window.lookupVessel = lookupVessel;
+window.imoInput = imoInput;
+window.jbinSetup = jbinSetup;
+window.histDelete = histDelete;
+window.histClearAll = histClearAll;
+window.histRender = histRender;
+window.histSaveCII = histSaveCII;
+window.histSaveEU = histSaveEU;
 window.histDelete = histDelete;
 window.histSaveCII = histSaveCII;
 window.histSaveEU = histSaveEU;
@@ -2197,129 +2305,189 @@ function dcsPrint() {
 
 
 // ══════════════════════════════════════════════════════════════════
-// HISTORY MODULE — localStorage persistence
+// HISTORY MODULE — JSONBin.io shared cloud storage
 // ══════════════════════════════════════════════════════════════════
-const HIST_KEY = 'cii_calc_history';
+const HIST_KEY  = 'cii_calc_history';    // localStorage fallback key
+const JBIN_CFG  = 'jsonbin_config';      // stores {binId, apiKey}
 const RTG_COLOR = {A:'#1B5E20',B:'#33691E',C:'#7B5E00',D:'#BF360C',E:'#B71C1C'};
 
-function histLoad() {
-  try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]'); }
-  catch(e) { return []; }
+// ── JSONBin config ─────────────────────────────────────────────────
+function jbinGetCfg() {
+  try { return JSON.parse(localStorage.getItem(JBIN_CFG)||'{}'); } catch(e){ return {}; }
 }
-function histSave(records) {
-  try { localStorage.setItem(HIST_KEY, JSON.stringify(records.slice(0,500))); }
-  catch(e) { console.warn('History save failed:', e); }
+function jbinSaveCfg(id, key) {
+  localStorage.setItem(JBIN_CFG, JSON.stringify({id, key}));
+}
+function jbinIsConfigured() {
+  const c = jbinGetCfg();
+  return !!(c.id && c.key);
 }
 
-// Auto-save CII result
-function histSaveCII() {
-  if (!BASE_RESULT) return;
-  const res = BASE_RESULT;
-  const el = id => document.getElementById(id);
-  const fuels = FUELS.map((f,i) => ({
-    name: f.name, cf: f.cf,
-    qty: parseFloat(el('cf-'+i)?.value)||0
-  })).filter(f => f.qty > 0);
+// ── JSONBin API calls ──────────────────────────────────────────────
+async function jbinRead() {
+  const c = jbinGetCfg();
+  if(!c.id || !c.key) return null;
+  try {
+    const r = await fetch(`https://api.jsonbin.io/v3/b/${c.id}/latest`, {
+      headers: {'X-Master-Key': c.key, 'X-Bin-Meta': 'false'},
+      signal: AbortSignal.timeout(8000)
+    });
+    if(!r.ok) return null;
+    const j = await r.json();
+    return Array.isArray(j) ? j : (j.records||null);
+  } catch(e) { return null; }
+}
 
-  const record = {
-    id: Date.now(),
-    ts: new Date().toISOString(),
-    kind: 'cii',
-    vessel:  el('c-name')?.value || '—',
-    type:    el('c-type')?.value || '—',
-    dwt:     parseFloat(el('c-dwt')?.value)||0,
-    gt:      parseFloat(el('c-gt')?.value)||0,
-    year:    parseInt(el('c-year')?.value)||0,
-    dist:    parseFloat(el('c-dist')?.value)||0,
-    fuels,
-    totalCO2: res.totalCO2,
-    attained: res.attained,
-    required: res.required,
-    refCII:   res.refCII,
-    ratio:    res.ratio,
-    rating:   res.rating,
-    redPct:   res.redPct,
-  };
-  const records = histLoad();
-  // Deduplicate: replace if same vessel+year+dist combo within last 5 min
+async function jbinWrite(records) {
+  const c = jbinGetCfg();
+  if(!c.id || !c.key) return false;
+  try {
+    const r = await fetch(`https://api.jsonbin.io/v3/b/${c.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Master-Key': c.key
+      },
+      body: JSON.stringify({records: records.slice(0,500)}),
+      signal: AbortSignal.timeout(8000)
+    });
+    return r.ok;
+  } catch(e) { return false; }
+}
+
+async function jbinCreate(key) {
+  // Create a new bin
+  try {
+    const r = await fetch('https://api.jsonbin.io/v3/b', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Master-Key': key,
+        'X-Bin-Name': 'CII-History',
+        'X-Bin-Private': 'false'
+      },
+      body: JSON.stringify({records: []}),
+      signal: AbortSignal.timeout(8000)
+    });
+    if(!r.ok) return null;
+    const j = await r.json();
+    return j.metadata?.id || null;
+  } catch(e) { return null; }
+}
+
+// ── Setup: save config from form ─────────────────────────────────
+async function jbinSetup() {
+  const keyInp = document.getElementById('jbin-api-key');
+  const idInp  = document.getElementById('jbin-bin-id');
+  const statusEl = document.getElementById('jbin-setup-status');
+  const key = (keyInp?.value||'').trim();
+  const id  = (idInp?.value||'').trim();
+
+  if(!key){ if(statusEl) statusEl.textContent='❌ API Key 不能为空'; return; }
+  if(statusEl) statusEl.textContent='⏳ 连接中…';
+
+  let binId = id;
+  if(!binId) {
+    // Auto-create a bin
+    binId = await jbinCreate(key);
+    if(!binId){ if(statusEl) statusEl.textContent='❌ 创建失败，请检查 API Key'; return; }
+    if(idInp) idInp.value = binId;
+    if(statusEl) statusEl.textContent=`✓ 已创建新 Bin: ${binId}`;
+  }
+
+  jbinSaveCfg(binId, key);
+  if(statusEl) statusEl.textContent=`✓ 已连接 Bin: ${binId}，请将此 Bin ID 分享给同事`;
+  document.getElementById('jbin-setup-section')?.style && 
+    (document.getElementById('jbin-connected-info').style.display='block');
+  document.getElementById('jbin-connected-id') &&
+    (document.getElementById('jbin-connected-id').textContent = binId);
+  await histRender();
+}
+
+// ── localStorage fallback ──────────────────────────────────────────
+function histLoadLocal() {
+  try { return JSON.parse(localStorage.getItem(HIST_KEY)||'[]'); } catch(e){ return []; }
+}
+function histSaveLocal(records) {
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(records.slice(0,500))); } catch(e){} 
+}
+
+// ── Save record (local + cloud) ────────────────────────────────────
+async function histSaveRecord(record) {
+  // Save locally first (instant)
+  const local = histLoadLocal();
   const now = Date.now();
-  const idx = records.findIndex(r =>
-    r.kind==='cii' && r.vessel===record.vessel &&
+  const dupIdx = local.findIndex(r =>
+    r.kind===record.kind && r.vessel===record.vessel &&
     r.year===record.year && Math.abs(now - r.id) < 300000
   );
-  if (idx >= 0) records[idx] = record;
-  else records.unshift(record);
-  histSave(records);
+  if(dupIdx >= 0) local[dupIdx] = record;
+  else local.unshift(record);
+  histSaveLocal(local);
   histUpdateCount();
-}
 
-// Auto-save EU result
-function histSaveEU() {
-  if (!euLastResult) return;
-  const r = euLastResult;
-  const g = id => document.getElementById(id);
-
-  // Collect leg summaries
-  const legs = [];
-  document.querySelectorAll('[id^="eu-leg-"]').forEach(legEl => {
-    const lid = legEl.id.replace('eu-leg-','');
-    if (!lid || isNaN(+lid)) return;
-    const dep = g('eu-pinp-'+lid+'-dep')?.value||'?';
-    const arr = g('eu-pinp-'+lid+'-arr')?.value||'?';
-    const dist = parseFloat(g('eu-dist-'+lid)?.value)||0;
-    const seaF = euReadFOC(lid,'sea');
-    const portF = euReadFOC(lid,'port');
-    legs.push({ dep, arr, dist,
-      fuels: [...seaF.map(f=>({...f,seg:'sea'})),
-               ...portF.map(f=>({...f,seg:'port'}))] });
-  });
-
-  const record = {
-    id: Date.now(),
-    ts: new Date().toISOString(),
-    kind: 'eu',
-    vessel:  g('eu-vname')?.value||'—',
-    vtype:   g('eu-vtype')?.value||'—',
-    imo:     g('eu-imo')?.value||'—',
-    gt:      g('eu-gt')?.value||'—',
-    dwt:     g('eu-dwt')?.value||'—',
-    company: g('eu-company')?.value||'—',
-    year:    g('eu-year')?.value||'—',
-    legs,
-    totEUA:     r.totEUA,
-    totPenalty: r.totPenalty,
-    totCO2:     r.totCO2,
-    totDist:    r.totDist||0,
-    reqGHG:     r.reqGHG||0,
-    fuelEURed:  r.fuelEURed||0,
-  };
-  const records = histLoad();
-  const now = Date.now();
-  const idx = records.findIndex(rec =>
-    rec.kind==='eu' && rec.vessel===record.vessel &&
-    rec.year===record.year && Math.abs(now - rec.id) < 300000
-  );
-  if (idx >= 0) records[idx] = record;
-  else records.unshift(record);
-  histSave(records);
-  histUpdateCount();
+  // Sync to cloud if configured
+  if(jbinIsConfigured()) {
+    const cloud = await jbinRead();
+    const merged = cloud ? cloud.slice() : local.slice();
+    const cidx = merged.findIndex(r =>
+      r.kind===record.kind && r.vessel===record.vessel &&
+      r.year===record.year && Math.abs(now - r.id) < 300000
+    );
+    if(cidx >= 0) merged[cidx] = record;
+    else merged.unshift(record);
+    await jbinWrite(merged.slice(0,500));
+  }
 }
 
 function histUpdateCount() {
-  const records = histLoad();
-  const countEl = document.getElementById('hist-total-count');
-  if (countEl) countEl.textContent = records.length + ' record' + (records.length===1?'':'s');
+  const records = histLoadLocal();
+  const el = document.getElementById('hist-total-count');
+  if(el) el.textContent = records.length + ' record' + (records.length===1?'':'s');
 }
 
-function histRender() {
-  const records = histLoad();
-  const search = (document.getElementById('hist-search')?.value||'').toLowerCase();
+async function histRender() {
+  const listEl = document.getElementById('hist-list');
+  if(!listEl) return;
+
+  // Show loading
+  listEl.innerHTML = '<div style="text-align:center;padding:30px;color:#A5B4FC">'+
+    (jbinIsConfigured()?'☁️ Loading from cloud…':'📂 Loading local records…')+'</div>';
+
+  // Load records
+  let records = [];
+  if(jbinIsConfigured()) {
+    const cloud = await jbinRead();
+    if(cloud) {
+      records = cloud;
+      histSaveLocal(cloud); // keep local in sync
+    } else {
+      records = histLoadLocal(); // fallback to local
+    }
+  } else {
+    records = histLoadLocal();
+  }
+
+  // Update setup status display
+  const cfg = jbinGetCfg();
+  const connInfo = document.getElementById('jbin-connected-info');
+  const connId   = document.getElementById('jbin-connected-id');
+  if(connInfo && cfg.id) {
+    connInfo.style.display='block';
+    if(connId) connId.textContent = cfg.id;
+  } else if(connInfo) {
+    connInfo.style.display='none';
+  }
+  const countEl = document.getElementById('hist-total-count');
+  if(countEl) countEl.textContent = records.length + ' record'+(records.length===1?'':'s');
+
+  const search     = (document.getElementById('hist-search')?.value||'').toLowerCase();
   const filterType = document.getElementById('hist-filter-type')?.value || 'all';
 
   const filtered = records.filter(r => {
-    if (filterType==='cii' && r.kind!=='cii') return false;
-    if (filterType==='eu'  && r.kind!=='eu')  return false;
-    if (!search) return true;
+    if(filterType==='cii' && r.kind!=='cii') return false;
+    if(filterType==='eu'  && r.kind!=='eu')  return false;
+    if(!search) return true;
     return (r.vessel||'').toLowerCase().includes(search) ||
            (r.type||r.vtype||'').toLowerCase().includes(search) ||
            (r.company||'').toLowerCase().includes(search) ||
@@ -2328,187 +2496,197 @@ function histRender() {
              l.arr?.toLowerCase().includes(search));
   });
 
-  // Update stats
+  // Stats
   const g = id => document.getElementById(id);
   const ciiRecs = records.filter(r=>r.kind==='cii');
   const euRecs  = records.filter(r=>r.kind==='eu');
-  const ratingDE = ciiRecs.filter(r=>r.rating==='D'||r.rating==='E').length;
-  const ratingAB = ciiRecs.filter(r=>r.rating==='A'||r.rating==='B').length;
   if(g('hs-total')) g('hs-total').textContent = records.length;
   if(g('hs-cii'))   g('hs-cii').textContent   = ciiRecs.length;
   if(g('hs-eu'))    g('hs-eu').textContent     = euRecs.length;
-  if(g('hs-rate-de')) g('hs-rate-de').textContent = ratingDE;
-  if(g('hs-rate-ab')) g('hs-rate-ab').textContent = ratingAB;
-  if(g('hist-total-count')) g('hist-total-count').textContent =
-    records.length + ' record' + (records.length===1?'':'s');
+  if(g('hs-rate-de')) g('hs-rate-de').textContent = ciiRecs.filter(r=>r.rating==='D'||r.rating==='E').length;
+  if(g('hs-rate-ab')) g('hs-rate-ab').textContent = ciiRecs.filter(r=>r.rating==='A'||r.rating==='B').length;
 
-  const listEl = document.getElementById('hist-list');
-  if (!listEl) return;
-
-  if (!filtered.length) {
+  if(!filtered.length) {
     listEl.innerHTML = `<div style="text-align:center;padding:60px 20px;color:#A5B4FC;font-size:13px">
-      <div style="font-size:36px;margin-bottom:12px">🔍</div>
-      ${records.length ? 'No records match your search.' :
-        'No records yet.<br><span style="font-size:11px;color:#C7D2FE">Records are saved automatically when you calculate.</span>'}
+      <div style="font-size:36px;margin-bottom:12px">${records.length?'🔍':'📭'}</div>
+      ${records.length ? 'No records match.' :
+        'No records yet.<br><span style="font-size:11px;color:#C7D2FE">Calculate a voyage to save records.</span>'}
     </div>`;
     return;
   }
 
-  const fmt  = (n,d=3) => typeof n==='number' ? n.toFixed(d) : '—';
-  const fmtN = (n,d=0) => typeof n==='number' ? n.toLocaleString(undefined,{maximumFractionDigits:d}) : '—';
+  const fmt  = (n,d=3) => typeof n==='number'?n.toFixed(d):'—';
+  const fmtN = (n,d=0) => typeof n==='number'?n.toLocaleString(undefined,{maximumFractionDigits:d}):'—';
 
-  listEl.innerHTML = filtered.map((rec, i) => {
+  listEl.innerHTML = filtered.map((rec,i) => {
     const dt = new Date(rec.ts);
     const dateStr = dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});
     const timeStr = dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
-    const bg = i%2===0 ? '#fff' : '#F8F8FF';
+    const bg = i%2===0?'#fff':'#F8F8FF';
 
-    if (rec.kind === 'cii') {
-      // CII record card
+    if(rec.kind==='cii') {
       const rtgBg = RTG_COLOR[rec.rating]||'#6B7280';
-      const fuelStr = (rec.fuels||[]).map(f=>`${f.name}: ${fmtN(f.qty,1)} t`).join(' · ') || '—';
-      return `<div style="background:${bg};border:1px solid #E0E7FF;border-radius:8px;
-        margin-bottom:8px;overflow:hidden">
-        <!-- Header -->
-        <div style="padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-          cursor:pointer" onclick="this.nextElementSibling.style.display=
-          this.nextElementSibling.style.display==='none'?'block':'none'">
-          <!-- Rating badge -->
-          <div style="width:36px;height:36px;border-radius:7px;background:${rtgBg};
-            display:flex;align-items:center;justify-content:center;
-            font-size:17px;font-weight:900;color:#fff;flex-shrink:0">${rec.rating||'?'}</div>
-          <!-- Type tag -->
-          <span style="font-size:10px;font-weight:800;padding:2px 8px;border-radius:10px;
-            background:#D1FAE5;color:#065F46">CII</span>
-          <!-- Vessel -->
+      const fuelStr = (rec.fuels||[]).map(f=>`${f.name}: ${fmtN(f.qty,1)} t`).join(' · ')||'—';
+      return `<div style="background:${bg};border:1px solid #E0E7FF;border-radius:8px;margin-bottom:8px;overflow:hidden">
+        <div style="padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;cursor:pointer"
+          onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+          <div style="width:36px;height:36px;border-radius:7px;background:${rtgBg};display:flex;align-items:center;
+            justify-content:center;font-size:17px;font-weight:900;color:#fff;flex-shrink:0">${rec.rating||'?'}</div>
+          <span style="font-size:10px;font-weight:800;padding:2px 8px;border-radius:10px;background:#D1FAE5;color:#065F46">CII</span>
           <div style="flex:1;min-width:140px">
             <div style="font-size:13px;font-weight:800;color:#1E1B4B">${rec.vessel||'—'}</div>
             <div style="font-size:10px;color:#6B7280">${rec.type||'—'} · ${rec.year||'—'} · DWT ${fmtN(rec.dwt)}</div>
           </div>
-          <!-- Metrics -->
           <div style="display:flex;gap:18px;align-items:center">
-            <div style="text-align:center">
-              <div style="font-size:15px;font-weight:900;color:#065F46;font-family:monospace">${fmt(rec.attained)}</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">Attained CII</div>
-            </div>
-            <div style="text-align:center">
-              <div style="font-size:15px;font-weight:900;color:#1D4ED8;font-family:monospace">${fmt(rec.required)}</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">Required CII</div>
-            </div>
-            <div style="text-align:center">
-              <div style="font-size:13px;font-weight:900;font-family:monospace;
-                color:${(rec.ratio||1)<1?'#059669':'#DC2626'}">${fmt(rec.ratio,3)}</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">Ratio</div>
-            </div>
-            <div style="text-align:center">
-              <div style="font-size:12px;font-weight:700;color:#374151;font-family:monospace">${fmtN(rec.dist)} nm</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">Distance</div>
-            </div>
-            <div style="text-align:right;min-width:65px">
-              <div style="font-size:10px;color:#9CA3AF">${dateStr}</div>
-              <div style="font-size:10px;color:#9CA3AF">${timeStr}</div>
-            </div>
+            <div style="text-align:center"><div style="font-size:15px;font-weight:900;color:#065F46;font-family:monospace">${fmt(rec.attained)}</div><div style="font-size:9px;color:#6B7280;font-weight:700">Attained CII</div></div>
+            <div style="text-align:center"><div style="font-size:15px;font-weight:900;color:#1D4ED8;font-family:monospace">${fmt(rec.required)}</div><div style="font-size:9px;color:#6B7280;font-weight:700">Required CII</div></div>
+            <div style="text-align:center"><div style="font-size:13px;font-weight:900;font-family:monospace;color:${(rec.ratio||1)<1?'#059669':'#DC2626'}">${fmt(rec.ratio,3)}</div><div style="font-size:9px;color:#6B7280;font-weight:700">Ratio</div></div>
+            <div style="text-align:center"><div style="font-size:12px;font-weight:700;color:#374151;font-family:monospace">${fmtN(rec.dist)} nm</div><div style="font-size:9px;color:#6B7280;font-weight:700">Distance</div></div>
+            <div style="text-align:right;min-width:65px"><div style="font-size:10px;color:#9CA3AF">${dateStr}</div><div style="font-size:10px;color:#9CA3AF">${timeStr}</div></div>
             <button onclick="event.stopPropagation();histDelete(${rec.id})"
-              style="background:none;border:1px solid #FCA5A5;border-radius:5px;
-              color:#EF4444;font-size:11px;cursor:pointer;padding:2px 8px;flex-shrink:0"
+              style="background:none;border:1px solid #FCA5A5;border-radius:5px;color:#EF4444;font-size:11px;cursor:pointer;padding:2px 8px"
               onmouseover="this.style.background='#FEE2E2'" onmouseout="this.style.background='none'">✕</button>
           </div>
         </div>
-        <!-- Detail (collapsed) -->
-        <div style="display:none;border-top:1px solid #E0E7FF;padding:10px 16px;background:#EEF2FF">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;
-            font-size:11px;margin-bottom:8px;color:#374151">
+        <div style="display:none;border-top:1px solid #E0E7FF;padding:10px 16px;background:#EEF2FF;font-size:11px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;margin-bottom:8px;color:#374151">
             <div><b>GT:</b> ${fmtN(rec.gt)}</div>
             <div><b>Total CO₂:</b> ${fmt(rec.totalCO2,1)} t</div>
             <div><b>Ref CII:</b> ${fmt(rec.refCII)}</div>
             <div><b>Reduction:</b> ${((rec.redPct||0)*100).toFixed(0)}%</div>
           </div>
-          <div style="font-size:11px;padding:6px 10px;background:#fff;border-radius:6px;border:1px solid #C7D2FE">
-            ⛽ ${fuelStr}
-          </div>
+          <div style="font-size:11px;padding:6px 10px;background:#fff;border-radius:6px;border:1px solid #C7D2FE">⛽ ${fuelStr}</div>
         </div>
       </div>`;
-
     } else {
-      // EU-ETS/FuelEU record card
-      const hasPenalty = (rec.totPenalty||0) > 0;
-      const routeStr = (rec.legs||[]).map(l=>`${l.dep||'?'} → ${l.arr||'?'}`).join(' | ') || '—';
-      const totalDist = (rec.legs||[]).reduce((s,l)=>s+(l.dist||0),0);
-      return `<div style="background:${bg};border:1px solid #BFDBFE;border-radius:8px;
-        margin-bottom:8px;overflow:hidden">
-        <div style="padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-          cursor:pointer" onclick="this.nextElementSibling.style.display=
-          this.nextElementSibling.style.display==='none'?'block':'none'">
-          <!-- Icon -->
-          <div style="width:36px;height:36px;border-radius:7px;background:#1D4ED8;
-            display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0">🌍</div>
-          <!-- Type tag -->
-          <span style="font-size:10px;font-weight:800;padding:2px 8px;border-radius:10px;
-            background:#DBEAFE;color:#1D4ED8">EU-ETS</span>
-          <!-- Vessel -->
+      const hasPenalty=(rec.totPenalty||0)>0;
+      const routeStr=(rec.legs||[]).map(l=>`${l.dep||'?'} → ${l.arr||'?'}`).join(' | ')||'—';
+      const totalDist=(rec.legs||[]).reduce((s,l)=>s+(l.dist||0),0);
+      return `<div style="background:${bg};border:1px solid #BFDBFE;border-radius:8px;margin-bottom:8px;overflow:hidden">
+        <div style="padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;cursor:pointer"
+          onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+          <div style="width:36px;height:36px;border-radius:7px;background:#1D4ED8;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0">🌍</div>
+          <span style="font-size:10px;font-weight:800;padding:2px 8px;border-radius:10px;background:#DBEAFE;color:#1D4ED8">EU-ETS</span>
           <div style="flex:1;min-width:140px">
             <div style="font-size:13px;font-weight:800;color:#1E1B4B">${rec.vessel||'—'}</div>
             <div style="font-size:10px;color:#6B7280">${rec.vtype||'—'} · ${rec.year||'—'} · ${routeStr}</div>
           </div>
-          <!-- Metrics -->
           <div style="display:flex;gap:18px;align-items:center">
-            <div style="text-align:center">
-              <div style="font-size:15px;font-weight:900;color:#1D4ED8;font-family:monospace">${fmt(rec.totEUA)}</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">EUA</div>
-            </div>
-            <div style="text-align:center">
-              <div style="font-size:15px;font-weight:900;font-family:monospace;
-                color:${hasPenalty?'#DC2626':'#059669'}">
-                ${hasPenalty?'€'+fmtN(rec.totPenalty,0):'✓ OK'}</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">Penalty</div>
-            </div>
-            <div style="text-align:center">
-              <div style="font-size:12px;font-weight:700;color:#374151;font-family:monospace">${fmtN(totalDist)} nm</div>
-              <div style="font-size:9px;color:#6B7280;font-weight:700">Distance</div>
-            </div>
-            <div style="text-align:right;min-width:65px">
-              <div style="font-size:10px;color:#9CA3AF">${dateStr}</div>
-              <div style="font-size:10px;color:#9CA3AF">${timeStr}</div>
-            </div>
+            <div style="text-align:center"><div style="font-size:15px;font-weight:900;color:#1D4ED8;font-family:monospace">${fmt(rec.totEUA)}</div><div style="font-size:9px;color:#6B7280;font-weight:700">EUA</div></div>
+            <div style="text-align:center"><div style="font-size:15px;font-weight:900;font-family:monospace;color:${hasPenalty?'#DC2626':'#059669'}">${hasPenalty?'€'+fmtN(rec.totPenalty,0):'✓ OK'}</div><div style="font-size:9px;color:#6B7280;font-weight:700">Penalty</div></div>
+            <div style="text-align:center"><div style="font-size:12px;font-weight:700;color:#374151;font-family:monospace">${fmtN(totalDist)} nm</div><div style="font-size:9px;color:#6B7280;font-weight:700">Distance</div></div>
+            <div style="text-align:right;min-width:65px"><div style="font-size:10px;color:#9CA3AF">${dateStr}</div><div style="font-size:10px;color:#9CA3AF">${timeStr}</div></div>
             <button onclick="event.stopPropagation();histDelete(${rec.id})"
-              style="background:none;border:1px solid #FCA5A5;border-radius:5px;
-              color:#EF4444;font-size:11px;cursor:pointer;padding:2px 8px;flex-shrink:0"
+              style="background:none;border:1px solid #FCA5A5;border-radius:5px;color:#EF4444;font-size:11px;cursor:pointer;padding:2px 8px"
               onmouseover="this.style.background='#FEE2E2'" onmouseout="this.style.background='none'">✕</button>
           </div>
         </div>
-        <!-- Detail (collapsed) -->
-        <div style="display:none;border-top:1px solid #BFDBFE;padding:10px 16px;background:#EFF6FF">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px;
-            font-size:11px;margin-bottom:8px;color:#374151">
+        <div style="display:none;border-top:1px solid #BFDBFE;padding:10px 16px;background:#EFF6FF;font-size:11px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px;margin-bottom:8px;color:#374151">
             <div><b>Company:</b> ${rec.company||'—'}</div>
             <div><b>IMO:</b> ${rec.imo||'—'} &nbsp; <b>GT:</b> ${fmtN(+rec.gt)}</div>
             <div><b>Total CO₂:</b> ${fmt(rec.totCO2,1)} mt</div>
-            <div><b>FuelEU Reduction:</b> ${((rec.fuelEURed||0)*100).toFixed(1)}%</div>
           </div>
-          ${(rec.legs||[]).map(l=>`
-            <div style="background:#fff;border:1px solid #BFDBFE;border-radius:6px;
-              padding:7px 12px;margin-bottom:5px;font-size:11px;display:flex;gap:14px;flex-wrap:wrap">
-              <span>🚢 <b>${l.dep||'?'}</b> → <b>${l.arr||'?'}</b></span>
-              <span>📏 ${fmtN(l.dist)} nm</span>
-              ${(l.fuels||[]).filter(f=>f.qty>0).map(f=>`<span>${f.name}: ${fmtN(f.qty,1)} t</span>`).join('')}
-            </div>`).join('')}
+          ${(rec.legs||[]).map(l=>`<div style="background:#fff;border:1px solid #BFDBFE;border-radius:6px;padding:7px 12px;margin-bottom:5px;font-size:11px;display:flex;gap:14px;flex-wrap:wrap">
+            <span>🚢 <b>${l.dep||'?'}</b> → <b>${l.arr||'?'}</b></span>
+            <span>📏 ${fmtN(l.dist)} nm</span>
+          </div>`).join('')}
         </div>
       </div>`;
     }
   }).join('');
 }
 
-function histDelete(id) {
-  if (!confirm('Delete this record?')) return;
-  const records = histLoad().filter(r => r.id !== id);
-  histSave(records);
+async function histDelete(id) {
+  if(!confirm('Delete this record?')) return;
+  // Remove locally
+  const local = histLoadLocal().filter(r=>r.id!==id);
+  histSaveLocal(local);
+  // Remove from cloud
+  if(jbinIsConfigured()) {
+    const cloud = await jbinRead();
+    if(cloud) await jbinWrite(cloud.filter(r=>r.id!==id));
+  }
   histRender();
 }
 
-function histClearAll() {
-  if (!confirm('Clear ALL history? This cannot be undone.')) return;
+async function histClearAll() {
+  if(!confirm('Clear ALL history? This cannot be undone.')) return;
   localStorage.removeItem(HIST_KEY);
+  if(jbinIsConfigured()) await jbinWrite([]);
   histRender();
+}
+
+function histSaveCII() {
+  if(!BASE_RESULT) return;
+  const res=BASE_RESULT;
+  const el=id=>document.getElementById(id);
+  const fuels=FUELS.map((f,i)=>({name:f.name,cf:f.cf,qty:parseFloat(el('cf-'+i)?.value)||0})).filter(f=>f.qty>0);
+  const record={
+    id:Date.now(), ts:new Date().toISOString(), kind:'cii',
+    vessel:el('c-name')?.value||'—', type:el('c-type')?.value||'—',
+    dwt:parseFloat(el('c-dwt')?.value)||0, gt:parseFloat(el('c-gt')?.value)||0,
+    year:parseInt(el('c-year')?.value)||0, dist:parseFloat(el('c-dist')?.value)||0,
+    fuels, totalCO2:res.totalCO2, attained:res.attained, required:res.required,
+    refCII:res.refCII, ratio:res.ratio, rating:res.rating, redPct:res.redPct,
+  };
+  histSaveRecord(record);
+}
+
+function histSaveEU() {
+  if(!euLastResult) return;
+  const r=euLastResult;
+  const g=id=>document.getElementById(id);
+  const legs=[];
+  document.querySelectorAll('[id^="eu-leg-"]').forEach(legEl=>{
+    const lid=legEl.id.replace('eu-leg-','');
+    if(!lid||isNaN(+lid)) return;
+    const dep=g('eu-pinp-'+lid+'-dep')?.value||'?';
+    const arr=g('eu-pinp-'+lid+'-arr')?.value||'?';
+    const dist=parseFloat(g('eu-dist-'+lid)?.value)||0;
+    legs.push({dep,arr,dist});
+  });
+  const record={
+    id:Date.now(), ts:new Date().toISOString(), kind:'eu',
+    vessel:g('eu-vname')?.value||'—', vtype:g('eu-vtype')?.value||'—',
+    imo:g('eu-imo')?.value||'—', gt:g('eu-gt')?.value||'—',
+    dwt:g('eu-dwt')?.value||'—', company:g('eu-company')?.value||'—',
+    year:g('eu-year')?.value||'—', legs,
+    totEUA:r.totEUA, totPenalty:r.totPenalty, totCO2:r.totCO2,
+    totDist:r.totDist||0, reqGHG:r.reqGHG||0, fuelEURed:r.fuelEURed||0,
+  };
+  histSaveRecord(record);
+}
+
+
+
+// ── JSONBin form helpers ──────────────────────────────────────────────────
+async function jbinTest() {
+  const statusEl = document.getElementById('jsonbin-test-status');
+  if(statusEl) statusEl.textContent = '⏳ 连接中…';
+
+  const id  = (document.getElementById('jsonbin-id')?.value||'').trim();
+  const key = (document.getElementById('jsonbin-key')?.value||'').trim();
+
+  if(!id || !key) {
+    if(statusEl) statusEl.textContent = '❌ 请先填写 Bin ID 和 API Key';
+    return;
+  }
+
+  try {
+    const r = await fetch(`https://api.jsonbin.io/v3/b/${id}/latest`, {
+      headers: {'X-Master-Key': key, 'X-Bin-Meta': 'false'},
+      signal: AbortSignal.timeout(8000)
+    });
+    if(r.ok) {
+      if(statusEl) statusEl.textContent = '✓ 连接成功！';
+      setTimeout(()=>{ if(statusEl) statusEl.textContent=''; }, 3000);
+    } else {
+      if(statusEl) statusEl.textContent = `❌ 连接失败 (${r.status})`;
+    }
+  } catch(e) {
+    if(statusEl) statusEl.textContent = '❌ 网络错误';
+  }
 }
 
 // ── INIT ──────────────────────────────────────────────────────────
@@ -2551,13 +2729,30 @@ document.addEventListener('DOMContentLoaded', function() {
 
   // History tab
   const histBtn = document.getElementById('tbtn-hist');
-  if(histBtn) histBtn.addEventListener('click', function(){ switchTab('hist'); histRender(); });
+  if(histBtn) histBtn.addEventListener('click', function(){ switchTab('hist'); histLoad(); });
   const histSearch = document.getElementById('hist-search');
-  if(histSearch) histSearch.addEventListener('input', histRender);
+  if(histSearch) histSearch.addEventListener('input', function(){ histLoad(); });
   const histFilter = document.getElementById('hist-filter-type');
-  if(histFilter) histFilter.addEventListener('change', histRender);
+  if(histFilter) histFilter.addEventListener('change', function(){ histLoad(); });
   const histClearBtn = document.getElementById('hist-clear-btn');
   if(histClearBtn) histClearBtn.addEventListener('click', histClearAll);
+  // Cloud config panel
+  const cloudCfgBtn = document.getElementById('hist-cloud-cfg-btn');
+  if(cloudCfgBtn) cloudCfgBtn.addEventListener('click', function(){
+    const p = document.getElementById('hist-cloud-panel');
+    if(p) p.style.display = p.style.display==='none'?'block':'none';
+  });
+  const jsonbinSaveBtn = document.getElementById('jsonbin-save-btn');
+  if(jsonbinSaveBtn) jsonbinSaveBtn.addEventListener('click', function(){
+    const id  = (document.getElementById('jsonbin-id')?.value||'').trim();
+    const key = (document.getElementById('jsonbin-key')?.value||'').trim();
+    if(id && key){ jbinSaveCfg(id, key);
+      const st = document.getElementById('jsonbin-test-status');
+      if(st){ st.textContent='✓ 已保存'; setTimeout(()=>st.textContent='',2000); }
+    }
+  });
+  const jsonbinTestBtn = document.getElementById('jsonbin-test-btn');
+  if(jsonbinTestBtn) jsonbinTestBtn.addEventListener('click', jbinTest);
   // Initialize everything
   initCalcFuels();
   initSimFuels();
@@ -3013,20 +3208,66 @@ document.addEventListener('DOMContentLoaded', function() {
       <span style="font-size:14px;font-weight:800;color:#3730A3">📊 Calculation History 历史记录</span>
       <span id="hist-total-count" style="font-size:11px;color:#4F46E5;background:#E0E7FF;
         padding:2px 10px;border-radius:12px;font-weight:700">0 records</span>
+      <span id="hist-sync-status" style="font-size:10px;color:#059669"></span>
     </div>
-    <div style="display:flex;gap:8px;align-items:center">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <input id="hist-search" type="text" placeholder="🔍 Search vessel / type…"
         style="padding:6px 12px;border:1px solid #C7D2FE;border-radius:6px;
-        background:#fff;color:#1E1B4B;font-size:12px;width:220px"/>
+        background:#fff;color:#1E1B4B;font-size:12px;width:200px"/>
       <select id="hist-filter-type" style="padding:6px 10px;border:1px solid #C7D2FE;
         border-radius:6px;background:#fff;color:#374151;font-size:12px">
         <option value="all">All Types</option>
         <option value="cii">CII Only</option>
         <option value="eu">EU-ETS/FuelEU Only</option>
       </select>
+      <button id="hist-cloud-cfg-btn"
+        style="padding:6px 12px;background:#6366F1;border:none;border-radius:6px;
+        color:#fff;font-size:11px;font-weight:700;cursor:pointer" title="云端共享设置">
+        ☁ 云端设置
+      </button>
       <button id="hist-clear-btn"
         style="padding:6px 14px;background:#EF4444;border:none;border-radius:6px;
         color:#fff;font-size:11px;font-weight:700;cursor:pointer">🗑 Clear All</button>
+    </div>
+  </div>
+
+  <!-- Cloud config panel -->
+  <div id="hist-cloud-panel" style="display:none;background:#E0E7FF;border:1px solid #C7D2FE;
+    border-top:none;padding:12px 18px;font-size:11px">
+    <div style="font-weight:800;color:#3730A3;margin-bottom:8px">
+      ☁ JSONBin 云端共享配置
+      <span style="font-weight:400;color:#6366F1;margin-left:8px">
+        免费 · 所有同事打开链接都能看到历史记录
+      </span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px">
+      <div>
+        <label style="display:block;color:#374151;margin-bottom:3px;font-weight:600">
+          Bin ID <a href="https://jsonbin.io" target="_blank"
+            style="color:#6366F1;font-weight:400">→ 免费注册 jsonbin.io</a>
+        </label>
+        <input id="jsonbin-id" type="text" placeholder="6xxxxxxxxxxxxxxxxxxxxxx"
+          style="width:100%;padding:6px 10px;border:1px solid #C7D2FE;border-radius:6px;
+          background:#fff;font-family:monospace;font-size:12px"/>
+      </div>
+      <div>
+        <label style="display:block;color:#374151;margin-bottom:3px;font-weight:600">Master Key (X-Master-Key)</label>
+        <input id="jsonbin-key" type="password" placeholder="$2a$10$..."
+          style="width:100%;padding:6px 10px;border:1px solid #C7D2FE;border-radius:6px;
+          background:#fff;font-family:monospace;font-size:12px"/>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button id="jsonbin-save-btn"
+        style="padding:6px 16px;background:#4F46E5;border:none;border-radius:6px;
+        color:#fff;font-size:11px;font-weight:700;cursor:pointer">💾 保存配置</button>
+      <button id="jsonbin-test-btn"
+        style="padding:6px 16px;background:#0891B2;border:none;border-radius:6px;
+        color:#fff;font-size:11px;font-weight:700;cursor:pointer">🔗 测试连接</button>
+      <span id="jsonbin-test-status" style="font-size:11px;color:#374151"></span>
+    </div>
+    <div style="margin-top:8px;color:#6B7280;font-size:10px;line-height:1.7">
+      📋 操作步骤：① 去 <b>jsonbin.io</b> 免费注册 → ② Dashboard 创建一个新 Bin（内容填 <code>[]</code>）→ ③ 复制 Bin ID 和 Master Key → ④ 填入上方保存 → ⑤ 把同样的 Bin ID 和 Key 告诉同事填入
     </div>
   </div>
 
