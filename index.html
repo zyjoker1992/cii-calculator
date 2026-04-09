@@ -1027,33 +1027,10 @@ async function lookupVessel() {
   setLookupStatus('','');
 
   try {
-    // Multi-proxy strategy to handle CORS
-    const directUrl = `https://api.vesselapi.com/v1/vessel/${imo}`;
-    // allorigins fetches server-side — we append key as query param via a wrapper
-    // corsproxy.io forwards all headers including Authorization
-    const proxyUrls = [
-      { url: directUrl,
-        opts: { headers: {'Authorization': `Bearer ${VESSEL_API_KEY}`} } },
-      { url: `https://corsproxy.io/?${encodeURIComponent(directUrl)}`,
-        opts: { headers: {'Authorization': `Bearer ${VESSEL_API_KEY}`,
-                          'x-requested-with': 'XMLHttpRequest'} } },
-      { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl + '?apikey=' + VESSEL_API_KEY)}`,
-        opts: {} },
-      { url: `https://thingproxy.freeboard.io/fetch/${directUrl}`,
-        opts: { headers: {'Authorization': `Bearer ${VESSEL_API_KEY}`} } },
-    ];
-
-    let res = null;
-    let lastErr = '';
-    for(const {url, opts} of proxyUrls){
-      try {
-        const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(7000) });
-        if(r.ok || r.status===404 || r.status===401 || r.status===429){
-          res = r; break;
-        }
-      } catch(e){ lastErr = e.message; continue; }
-    }
-    if(!res) throw new Error(lastErr || 'All proxies failed');
+    // Call our own backend proxy (server.js) — no CORS issues
+    const res = await fetch(`/api/vessel?imo=${imo}`, {
+      signal: AbortSignal.timeout(8000)
+    });
 
     if(!res.ok) {
       if(res.status===401) { setLookupStatus('❌ Invalid API Key','status-err'); return; }
